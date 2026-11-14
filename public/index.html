@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GitFlow — Authenticating Session</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/login.css" />
+</head>
+<body class="gate-screen">
+  <main class="gate-card" aria-live="polite">
+    <div class="gate-spinner" aria-hidden="true"></div>
+    <p class="gate-label">VERIFYING ACCESS GATE...</p>
+  </main>
+  <noscript>
+    <meta http-equiv="refresh" content="0;url=/login.html" />
+  </noscript>
+  <script>
+    (function () {
+      'use strict';
+      // Initial Login Requirement: Opening the site must direct unauthenticated users straight to Login.
+      // Never render dashboard content from index.html.
+      var token = null;
+      try {
+        token = sessionStorage.getItem('gitflow_session_token');
+      } catch (_) {
+        token = null;
+      }
+
+      if (!token) {
+        window.location.replace('/login.html');
+        return;
+      }
+
+      fetch('/api/auth-check', {
+        method: 'GET',
+        headers: {
+          'x-gitflow-auth': token
+        },
+        cache: 'no-store'
+      })
+        .then(function (res) {
+          if (res.ok) {
+            window.location.replace('/dashboard.html');
+          } else {
+            try { sessionStorage.removeItem('gitflow_session_token'); } catch (_) {}
+            window.location.replace('/login.html');
+          }
+        })
+        .catch(function () {
+          window.location.replace('/login.html');
+        });
+    })();
+  </script>
+</body>
+</html>
