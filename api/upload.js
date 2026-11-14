@@ -4,7 +4,6 @@ const Busboy = require('busboy');
 const JSZip = require('jszip');
 const { requireAuth } = require('./_lib/auth');
 const {
-  GitHubApiError,
   verifyRepository,
   inspectBranchState,
   createBlobsForFiles,
@@ -19,224 +18,598 @@ const MAX_EXPANDED_BYTES = 18 * 1024 * 1024; // 18 MB
 
 function formatTimestamp(date = new Date()) {
   const pad = (n) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function sendLog(res, wantsStream, level, message, extra = {}) {
-  const entry = {
-    ts: formatTimestamp(),
-    level,
-    message,
-    ...extra
-  };
-  if (wantsStream) {
-    res.write(JSON.stringify(entry) + '\n');
+/**
+ * Validates and normalizes an entry path from a ZIP archive.
+ * - Rejects path traversal (..), backslashes, null bytes, leading slashes, Windows drive letters.
+ * - Ignores .git directories and .git metadata files.
+ */
+function validateAndNormalizeZipPath(rawPath) {
+  if (!rawPath || typeof rawPath !== 'string') {
+    return { valid: false, error: 'Empty or non-string file path in archive.' };
   }
-  return entry;
+
+  if (rawPath.includes('\0')) {
+    return { valid: false, error: `Invalid null byte detected in path: "${rawPath}"` };
+  }
+
+  if (rawPath.includes('\\')) {
+    return { valid: false, error: `Backslash path separator rejected for security: "${rawPath}"` };
+  }
+
+  if (/^[A-Za-z]:/.test(rawPath) || rawPath.startsWith('/')) {
+    return { valid: false, error: `Absolute or drive-prefixed path rejected: "${rawPath}"` };
+  }
+
+  const normalized = rawPath.replace(/\/+/g, '/').replace(/\/$/, '');
+  if (!normalized) {
+    return { ignore: true };
+  }
+
+  const segments = normalized.split('/');
+  for (const seg of segments) {
+    if (!seg || seg === '.' || seg === '..') {
+      return {
+        valid: false,
+        error: `Path traversal or relative segment rejected: "${rawPath}"`
+      };
+    }
+  }
+
+  if (segments.includes('.git') || segments[0] === '__MACOSX' || segments[segments.length - 1] === '.DS_Store') {
+    if (segments.includes('.git')) {
+      return { ignore: true, reason: 'git_dir' };
+    }
+  }
+
+  return {
+    valid: true,
+    ignore: false,
+    path: segments.join('/')
+  };
 }
 
-function sanitizePath(entryName) {
-  if (!entryName || typeof entryName !== 'string') return null;
-  let p = entryName.replace(/\\/g, '/').replace(/\0/g, '');
-  if (p.startsWith('/')) p = p.slice(1);
-  if (p.includes('..') || p.includes('\0')) return null;
-  if (p.startsWith('.git/') || p === '.git') return null;
-  return p || null;
+function isSymlinkEntry(zipEntry) {
+  if (!zipEntry || typeof zipEntry.unixPermissions !== 'number') {
+    return false;
+  }
+  const S_IFMT = 0o170000;
+  const S_IFLNK = 0o120000;
+  return (zipEntry.unixPermissions & S_IFMT) === S_IFLNK;
 }
 
-module.exports = async function handler(req, res) {
+function parseMultipartUpload(req) {
+  return new Promise((resolve, reject) => {
+    const contentType = req.headers['content-type'] || '';
+    if (!contentType.toLowerCase().includes('multipart/form-data')) {
+      return reject({
+        status: 400,
+        code: 'INVALID_CONTENT_TYPE',
+        stage: 'receive_zip',
+        message: 'Format upload harus berupa multipart/form-data.',
+        action: 'Unggah file ZIP melalui form GitFlow Workspace.'
+      });
+    }
+
+    let busboy;
+    try {
+      busboy = Busboy({
+        headers: req.headers,
+        limits: {
+          fileSize: MAX_ZIP_BYTES,
+          files: 1,
+          fields: 12
+        }
+      });
+    } catch (_) {
+      return reject({
+        status: 400,
+        code: 'MULTIPART_PARSE_ERROR',
+        stage: 'receive_zip',
+        message: 'Gagal menginisialisasi parser multipart upload.',
+        action: 'Pastikan file ZIP valid dan ulangi proses upload.'
+      });
+    }
+
+    const fields = {};
+    let fileBuffer = null;
+    let fileName = '';
+    let fileExceededLimit = false;
+
+    busboy.on('field', (name, val) => {
+      fields[name] = String(val || '').trim();
+    });
+
+    busboy.on('file', (name, fileStream, info) => {
+      fileName = info?.filename || 'archive.zip';
+      const chunks = [];
+      let totalBytes = 0;
+
+      fileStream.on('data', (chunk) => {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_ZIP_BYTES) {
+          fileExceededLimit = true;
+          fileStream.resume();
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      fileStream.on('limit', () => {
+        fileExceededLimit = true;
+      });
+
+      fileStream.on('end', () => {
+        if (!fileExceededLimit) {
+          fileBuffer = Buffer.concat(chunks);
+        }
+      });
+    });
+
+    busboy.on('error', (err) => {
+      reject({
+        status: 400,
+        code: 'UPLOAD_STREAM_ERROR',
+        stage: 'receive_zip',
+        message: `Gagal membaca stream upload: ${err.message || 'Unknown error'}`,
+        action: 'Periksa koneksi jaringan dan coba unggah kembali.'
+      });
+    });
+
+    busboy.on('finish', () => {
+      if (fileExceededLimit) {
+        return reject({
+          status: 413,
+          code: 'ZIP_SIZE_EXCEEDED',
+          stage: 'receive_zip',
+          message: 'Ukuran file ZIP melebihi batas maksimum 4 MB.',
+          action: 'Perkecil ukuran archive ZIP (maksimal 4 MB) atau hapus aset besar seperti node_modules.'
+        });
+      }
+      if (!fileBuffer || fileBuffer.length === 0) {
+        return reject({
+          status: 400,
+          code: 'MISSING_ZIP_FILE',
+          stage: 'receive_zip',
+          message: 'File ZIP tidak ditemukan atau kosong.',
+          action: 'Pilih file ZIP yang valid sebelum menekan tombol Deploy.'
+        });
+      }
+      resolve({ fields, fileBuffer, fileName });
+    });
+
+    if (req.rawBody && Buffer.isBuffer(req.rawBody)) {
+      busboy.end(req.rawBody);
+    } else {
+      req.pipe(busboy);
+    }
+  });
+}
+
+async function extractAndValidateZip(zipBuffer, { stripRootFolder = false } = {}) {
+  let zip;
+  try {
+    zip = await JSZip.loadAsync(zipBuffer, { checkCRC32: true });
+  } catch (_) {
+    throw {
+      status: 400,
+      code: 'INVALID_ZIP',
+      stage: 'extract_archive',
+      message: 'File yang diunggah bukan archive ZIP yang valid atau rusak (corrupted).',
+      action: 'Pastikan file berformat .zip standar dan tidak diproteksi password.'
+    };
+  }
+
+  const rawEntries = [];
+  const entryNames = Object.keys(zip.files);
+
+  for (const rawName of entryNames) {
+    const entry = zip.files[rawName];
+
+    if (isSymlinkEntry(entry)) {
+      throw {
+        status: 400,
+        code: 'UNSUPPORTED_SYMLINK',
+        stage: 'validate_paths',
+        message: `Symbolic link tidak didukung ditemukan pada path: "${rawName}".`,
+        action: 'Hapus symlink dari archive ZIP sebelum melakukan deployment.'
+      };
+    }
+
+    if (entry.dir) {
+      const dirCheck = validateAndNormalizeZipPath(rawName);
+      if (dirCheck.valid === false) {
+        throw {
+          status: 400,
+          code: 'INVALID_FILE_PATH',
+          stage: 'validate_paths',
+          message: dirCheck.error,
+          action: 'Pastikan archive ZIP tidak memiliki path relatif (..) atau karakter ilegal.'
+        };
+      }
+      continue;
+    }
+
+    const pathCheck = validateAndNormalizeZipPath(rawName);
+    if (pathCheck.valid === false) {
+      throw {
+        status: 400,
+        code: 'INVALID_FILE_PATH',
+        stage: 'validate_paths',
+        message: pathCheck.error,
+        action: 'Bersihkan nama file dari karakter ilegal atau path traversal (..).'
+      };
+    }
+    if (pathCheck.ignore) {
+      continue;
+    }
+
+    rawEntries.push({
+      originalPath: pathCheck.path,
+      entry
+    });
+  }
+
+  if (rawEntries.length === 0) {
+    throw {
+      status: 400,
+      code: 'EMPTY_ZIP_ARCHIVE',
+      stage: 'extract_archive',
+      message: 'Archive ZIP tidak memiliki file yang dapat diunggah.',
+      action: 'Pastikan ZIP berisi minimal 1 file project di luar folder .git.'
+    };
+  }
+
+  if (rawEntries.length > MAX_EXTRACTED_FILES) {
+    throw {
+      status: 400,
+      code: 'FILE_COUNT_EXCEEDED',
+      stage: 'extract_archive',
+      message: `Jumlah file di dalam ZIP (${rawEntries.length} file) melebihi batas maksimum ${MAX_EXTRACTED_FILES} file.`,
+      action: 'Pastikan folder seperti node_modules, .next, atau dist tidak ikut dikompres ke dalam ZIP.'
+    };
+  }
+
+  let commonRootPrefix = '';
+  if (stripRootFolder && rawEntries.length > 0) {
+    const firstParts = rawEntries[0].originalPath.split('/');
+    if (firstParts.length > 1) {
+      const candidateRoot = `${firstParts[0]}/`;
+      const allShareRoot = rawEntries.every((item) => item.originalPath.startsWith(candidateRoot));
+      if (allShareRoot) {
+        commonRootPrefix = candidateRoot;
+      }
+    }
+  }
+
+  const extractedFiles = [];
+  const seenPaths = new Set();
+  const folderSet = new Set();
+  let totalExpandedBytes = 0;
+
+  for (const item of rawEntries) {
+    const finalPath = commonRootPrefix
+      ? item.originalPath.slice(commonRootPrefix.length)
+      : item.originalPath;
+
+    if (!finalPath) continue;
+
+    const segments = finalPath.split('/');
+    if (segments.includes('.git')) {
+      continue;
+    }
+
+    if (seenPaths.has(finalPath)) {
+      throw {
+        status: 400,
+        code: 'DUPLICATE_PATH',
+        stage: 'validate_paths',
+        message: `Path file duplikat terdeteksi di dalam archive: "${finalPath}".`,
+        action: 'Pastikan tidak ada path file yang terduplikasi di dalam ZIP.'
+      };
+    }
+    seenPaths.add(finalPath);
+
+    for (let i = 1; i < segments.length; i++) {
+      folderSet.add(segments.slice(0, i).join('/'));
+    }
+
+    const contentBuffer = await item.entry.async('nodebuffer');
+    totalExpandedBytes += contentBuffer.length;
+
+    if (totalExpandedBytes > MAX_EXPANDED_BYTES) {
+      throw {
+        status: 413,
+        code: 'EXPANDED_SIZE_EXCEEDED',
+        stage: 'extract_archive',
+        message: 'Total ukuran hasil ekstraksi melebihi batas maksimum 18 MB.',
+        action: 'Kurangi ukuran file di dalam ZIP hingga hasil ekstraksi di bawah 18 MB.'
+      };
+    }
+
+    let mode = '100644';
+    if (typeof item.entry.unixPermissions === 'number' && (item.entry.unixPermissions & 0o111) !== 0) {
+      mode = '100755';
+    }
+
+    extractedFiles.push({
+      path: finalPath,
+      size: contentBuffer.length,
+      mode,
+      buffer: contentBuffer
+    });
+  }
+
+  if (extractedFiles.length === 0) {
+    throw {
+      status: 400,
+      code: 'EMPTY_ZIP_ARCHIVE',
+      stage: 'extract_archive',
+      message: 'Tidak ada file valid yang tersisa setelah pembersihan struktur archive.',
+      action: 'Periksa isi file ZIP Anda dan coba lagi.'
+    };
+  }
+
+  return {
+    files: extractedFiles,
+    totalFiles: extractedFiles.length,
+    totalFolders: folderSet.size,
+    totalExpandedBytes,
+    strippedRoot: commonRootPrefix ? commonRootPrefix.replace(/\/$/, '') : null
+  };
+}
+
+async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
 
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
-    return res.status(405).json({ ok: false, code: 'METHOD_NOT_ALLOWED', error: 'Method tidak didukung.' });
+    return res.status(405).json({
+      ok: false,
+      code: 'METHOD_NOT_ALLOWED',
+      error: 'Method tidak didukung.'
+    });
   }
 
   const session = requireAuth(req, res);
   if (!session) return;
 
-  const wantsStream = (req.headers.accept || '').includes('application/x-ndjson') ||
-    req.query?.stream === '1' || req.query?.stream === 'true';
-
-  if (wantsStream) {
-    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.statusCode = 200;
-  }
+  const wantsStream =
+    req.headers['x-gitflow-stream'] === '1' ||
+    (req.headers['accept'] || '').includes('application/x-ndjson');
 
   const logs = [];
-  const log = (level, message, extra) => {
-    const entry = sendLog(res, wantsStream, level, message, extra);
+  let currentStage = 'init';
+
+  function emitProgress({ status = 'PROCESSING', percent = 0, level = 'INFO', message = '', stage = currentStage }) {
+    currentStage = stage;
+    const entry = {
+      type: 'progress',
+      timestamp: formatTimestamp(),
+      status,
+      percent,
+      level,
+      stage,
+      message
+    };
     logs.push(entry);
-    return entry;
-  };
+    if (wantsStream && !res.writableEnded) {
+      res.write(JSON.stringify(entry) + '\n');
+    }
+  }
+
+  if (wantsStream) {
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'Transfer-Encoding': 'chunked',
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+      'X-Accel-Buffering': 'no'
+    });
+  }
 
   try {
-    log('info', 'Memulai proses upload ZIP...');
+    emitProgress({
+      status: 'PROCESSING',
+      percent: 5,
+      level: 'INFO',
+      stage: 'upload_started',
+      message: 'Upload job started'
+    });
 
-    // Parse multipart with Busboy
-    const fields = {};
-    let zipBuffer = null;
-    let zipFilename = 'project.zip';
+    const { fields, fileBuffer, fileName } = await parseMultipartUpload(req);
 
-    await new Promise((resolve, reject) => {
-      const busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_ZIP_BYTES + 1024 } });
+    const repoFullName = String(fields.repository || fields.repo || '').trim();
+    const requestedBranch = String(fields.branch || '').trim();
+    const commitMessage = String(fields.commitMessage || 'Upload project files').trim() || 'Upload project files';
+    const stripRootFolder = fields.stripRoot === 'true' || fields.stripRoot === '1';
 
-      busboy.on('file', (name, file, info) => {
-        if (name !== 'zip' && name !== 'file') {
-          file.resume();
-          return;
+    if (!repoFullName || !repoFullName.includes('/')) {
+      throw {
+        status: 400,
+        code: 'INVALID_REPOSITORY',
+        stage: 'verify_repository',
+        message: 'Destination repository belum dipilih atau format tidak valid (owner/repo).',
+        action: 'Pilih repository tujuan dari daftar atau buat repository baru terlebih dahulu.'
+      };
+    }
+
+    const [owner, repo] = repoFullName.split('/');
+
+    emitProgress({
+      status: 'PROCESSING',
+      percent: 12,
+      level: 'INFO',
+      stage: 'verify_repository',
+      message: `Checking repository ${owner}/${repo}`
+    });
+
+    const repoInfo = await verifyRepository(owner, repo);
+    const targetBranch = requestedBranch || repoInfo.defaultBranch || 'main';
+
+    if (!/^[A-Za-z0-9._/-]+$/.test(targetBranch) || targetBranch.includes('..') || targetBranch.startsWith('/') || targetBranch.endsWith('/')) {
+      throw {
+        status: 400,
+        code: 'INVALID_BRANCH_NAME',
+        stage: 'verify_branch',
+        message: `Nama branch "${targetBranch}" tidak valid.`,
+        action: 'Gunakan nama branch standar seperti main, master, atau feature/update.'
+      };
+    }
+
+    const branchState = await inspectBranchState(owner, repo, targetBranch, repoInfo.defaultBranch);
+
+    emitProgress({
+      status: 'PROCESSING',
+      percent: 22,
+      level: 'SUCCESS',
+      stage: 'verify_repository',
+      message: `Repository verified (${repoInfo.fullName} @ ${targetBranch}${branchState.isEmptyRepo ? ' — empty repo auto-init mode' : ''})`
+    });
+
+    emitProgress({
+      status: 'PROCESSING',
+      percent: 28,
+      level: 'SUCCESS',
+      stage: 'receive_zip',
+      message: `Archive received (${fileName}, ${(fileBuffer.length / 1024).toFixed(1)} KB)`
+    });
+
+    const extracted = await extractAndValidateZip(fileBuffer, { stripRootFolder });
+
+    emitProgress({
+      status: 'PROCESSING',
+      percent: 38,
+      level: 'SUCCESS',
+      stage: 'extract_archive',
+      message: `${extracted.totalFiles} files extracted across ${extracted.totalFolders} folders`
+    });
+
+    emitProgress({
+      status: 'PROCESSING',
+      percent: 42,
+      level: 'INFO',
+      stage: 'create_blobs',
+      message: `Creating Git blobs (${extracted.totalFiles} files)`
+    });
+
+    let lastReportedMilestone = 0;
+    const { treeItems, bootstrappedRepo, bootstrapCommitSha } = await createBlobsForFiles(owner, repo, extracted.files, {
+      branch: targetBranch,
+      isEmptyRepo: branchState.isEmptyRepo,
+      concurrency: 6,
+      onProgress: (done, total) => {
+        const ratio = done / total;
+        const pct = Math.min(78, Math.round(42 + ratio * 36));
+        const stepSize = Math.max(1, Math.ceil(total / 4));
+        if (done === total || done - lastReportedMilestone >= stepSize) {
+          lastReportedMilestone = done;
+          emitProgress({
+            status: 'PROCESSING',
+            percent: pct,
+            level: 'INFO',
+            stage: 'create_blobs',
+            message: `Uploaded ${done}/${total} Git blobs`
+          });
         }
-        zipFilename = info.filename || zipFilename;
-        const chunks = [];
-        let total = 0;
-        file.on('data', (chunk) => {
-          total += chunk.length;
-          if (total > MAX_ZIP_BYTES) {
-            file.destroy();
-            reject(new Error('ZIP terlalu besar (maks 4 MB).'));
-            return;
-          }
-          chunks.push(chunk);
-        });
-        file.on('end', () => {
-          zipBuffer = Buffer.concat(chunks);
-        });
-        file.on('error', reject);
-      });
-
-      busboy.on('field', (name, val) => {
-        fields[name] = val;
-      });
-
-      busboy.on('finish', resolve);
-      busboy.on('error', reject);
-
-      req.pipe(busboy);
+      }
     });
 
-    if (!zipBuffer || zipBuffer.length === 0) {
-      throw Object.assign(new Error('File ZIP tidak ditemukan di request.'), { status: 400, code: 'NO_ZIP' });
-    }
+    const baseTreeSha = branchState.isEmptyRepo ? null : branchState.treeSha;
+    const newTreeSha = await createGitTree(owner, repo, treeItems, baseTreeSha);
 
-    log('info', `ZIP diterima: ${zipFilename} (${(zipBuffer.length / 1024).toFixed(1)} KB)`);
+    emitProgress({
+      status: 'PROCESSING',
+      percent: 86,
+      level: 'SUCCESS',
+      stage: 'create_tree',
+      message: `Git tree created (${newTreeSha.slice(0, 7)})`
+    });
 
-    const owner = String(fields.owner || fields.repoOwner || '').trim();
-    const repo = String(fields.repo || fields.repoName || '').trim();
-    const branch = String(fields.branch || 'main').trim() || 'main';
-    const commitMessage = String(fields.message || fields.commitMessage || 'Upload project files').trim();
+    emitProgress({
+      status: 'PROCESSING',
+      percent: 92,
+      level: 'INFO',
+      stage: 'create_commit',
+      message: 'Creating commit'
+    });
 
-    if (!owner || !repo) {
-      throw Object.assign(new Error('Parameter owner dan repo wajib diisi.'), { status: 400, code: 'MISSING_REPO' });
-    }
-
-    log('info', `Target: ${owner}/${repo} @ ${branch}`);
-
-    // Extract ZIP
-    log('info', 'Mengekstrak isi ZIP...');
-    const zip = await JSZip.loadAsync(zipBuffer);
-    const files = [];
-    let expandedBytes = 0;
-
-    const entries = Object.keys(zip.files);
-    for (const name of entries) {
-      const entry = zip.files[name];
-      if (entry.dir) continue;
-
-      const safePath = sanitizePath(name);
-      if (!safePath) {
-        log('warn', `Path diabaikan: ${name}`);
-        continue;
-      }
-
-      // Skip symlink-like entries if mode indicates
-      const content = await entry.async('string');
-      expandedBytes += Buffer.byteLength(content, 'utf8');
-
-      if (files.length >= MAX_EXTRACTED_FILES) {
-        throw Object.assign(new Error(`Jumlah file melebihi batas (${MAX_EXTRACTED_FILES}).`), {
-          status: 400,
-          code: 'TOO_MANY_FILES'
-        });
-      }
-      if (expandedBytes > MAX_EXPANDED_BYTES) {
-        throw Object.assign(new Error('Total ukuran hasil ekstraksi melebihi 18 MB.'), {
-          status: 400,
-          code: 'EXPANDED_TOO_LARGE'
-        });
-      }
-
-      files.push({ path: safePath, content });
-    }
-
-    if (files.length === 0) {
-      throw Object.assign(new Error('ZIP tidak berisi file yang valid.'), { status: 400, code: 'EMPTY_ZIP' });
-    }
-
-    log('info', `Ekstraksi selesai: ${files.length} file, ${(expandedBytes / 1024).toFixed(1)} KB`);
-
-    // Verify repo
-    log('info', 'Memverifikasi repository...');
-    await verifyRepository(owner, repo);
-
-    // Inspect branch
-    log('info', `Memeriksa branch ${branch}...`);
-    const branchState = await inspectBranchState(owner, repo, branch);
-    const baseTreeSha = branchState.exists ? null : null; // simplified; full impl uses commit tree
-    let parentSha = branchState.sha || null;
-
-    // Create blobs
-    log('info', 'Mengunggah blob ke GitHub...');
-    const treeEntries = await createBlobsForFiles(owner, repo, files);
-    log('info', `${treeEntries.length} blob berhasil dibuat`);
-
-    // Create tree
-    log('info', 'Membuat Git tree...');
-    const treeSha = await createGitTree(owner, repo, treeEntries, null);
-    log('info', `Tree SHA: ${treeSha.slice(0, 8)}...`);
-
-    // Create commit
-    log('info', 'Membuat commit...');
-    const commitSha = await createGitCommit(owner, repo, {
+    const parentCommitSha = branchState.isEmptyRepo ? null : branchState.commitSha;
+    const commitResult = await createGitCommit(owner, repo, {
       message: commitMessage,
-      treeSha,
-      parentSha
+      treeSha: newTreeSha,
+      parentCommitSha
     });
-    log('info', `Commit SHA: ${commitSha.slice(0, 8)}...`);
 
-    // Update ref
-    log('info', `Memperbarui branch ${branch}...`);
-    await updateOrCreateBranchRef(owner, repo, branch, commitSha, false);
+    const refUpdate = await updateOrCreateBranchRef(owner, repo, {
+      branch: targetBranch,
+      commitSha: commitResult.sha,
+      branchExists: branchState.exists,
+      bootstrappedRepo,
+      bootstrapCommitSha,
+      treeSha: newTreeSha,
+      commitMessage
+    });
 
-    log('success', 'Upload selesai. Commit berhasil dibuat.');
+    const finalSha = refUpdate?.finalCommitSha || commitResult.sha;
 
-    const result = {
+    emitProgress({
+      status: 'SUCCESS',
+      percent: 100,
+      level: 'SUCCESS',
+      stage: 'completed',
+      message: `Commit completed (${finalSha.slice(0, 7)})`
+    });
+
+    const finalPayload = {
+      type: 'result',
       ok: true,
-      commitSha,
-      treeSha,
-      branch,
-      filesCount: files.length,
-      message: commitMessage,
+      status: 'SUCCESS',
+      result: {
+        commitSha: finalSha,
+        shortSha: finalSha.slice(0, 7),
+        repository: repoInfo.fullName,
+        repoUrl: repoInfo.htmlUrl,
+        branch: targetBranch,
+        branchUrl: `${repoInfo.htmlUrl}/tree/${encodeURIComponent(targetBranch)}`,
+        commitUrl: `https://github.com/${owner}/${repo}/commit/${finalSha}`,
+        commitMessage,
+        totalFiles: extracted.totalFiles,
+        totalFolders: extracted.totalFolders,
+        totalBytes: extracted.totalExpandedBytes,
+        isInitialCommit: Boolean(branchState.isEmptyRepo)
+      },
       logs
     };
 
     if (wantsStream) {
-      res.write(JSON.stringify(result) + '\n');
+      res.write(JSON.stringify(finalPayload) + '\n');
       return res.end();
     }
 
-    return res.status(200).json(result);
+    return res.status(200).json(finalPayload);
   } catch (err) {
-    const status = err.status || (err instanceof GitHubApiError ? err.status : 500);
-    const code = err.code || (err instanceof GitHubApiError ? err.code : 'UPLOAD_FAILED');
-    const stage = err.stage || (err instanceof GitHubApiError ? err.stage : 'upload');
-    const message = err.message || 'Gagal mengunggah project.';
-    const action = err.action || 'Periksa ukuran ZIP, token, dan izin repository.';
+    const status = (err && typeof err.status === 'number') ? err.status : 500;
+    const code = (err && err.code) ? err.code : 'DEPLOYMENT_FAILED';
+    const stage = (err && err.stage) ? err.stage : currentStage;
+    const message = (err && err.message) ? err.message : 'Terjadi kesalahan saat memproses upload ke GitHub.';
+    const action = (err && err.action)
+      ? err.action
+      : 'Periksa kembali file ZIP, izin repository, dan konfigurasi GITHUB_TOKEN Anda.';
 
-    log('error', message, { code, stage });
+    emitProgress({
+      status: 'FAILED',
+      percent: 100,
+      level: 'ERROR',
+      stage,
+      message: `Error [${stage}]: ${message}`
+    });
 
     const errorPayload = {
+      type: 'result',
       ok: false,
+      status: 'FAILED',
       code,
       stage,
       error: message,
@@ -251,10 +624,14 @@ module.exports = async function handler(req, res) {
 
     return res.status(status).json(errorPayload);
   }
-};
+}
 
-module.exports.config = {
+handler.config = {
   api: {
     bodyParser: false
   }
 };
+handler.validateAndNormalizeZipPath = validateAndNormalizeZipPath;
+handler.extractAndValidateZip = extractAndValidateZip;
+
+module.exports = handler;
