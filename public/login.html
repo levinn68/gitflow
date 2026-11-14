@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GitFlow — Access Gate</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/login.css" />
+</head>
+<body>
+  <div class="ambient-grid" aria-hidden="true"></div>
+  <div class="ambient-glow" aria-hidden="true"></div>
+
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <header class="brand-header">
+        <div class="brand-badge">
+          <div class="cube-scene" aria-hidden="true">
+            <div class="cube-3d">
+              <span class="face front"></span>
+              <span class="face back"></span>
+              <span class="face right"></span>
+              <span class="face left"></span>
+              <span class="face top"></span>
+              <span class="face bottom"></span>
+            </div>
+          </div>
+          <div class="brand-meta">
+            <span class="brand-tag">VERCEL ONLY · GITHUB REST API</span>
+            <h1 id="login-title" class="brand-title">GitFlow <span>v1.0</span></h1>
+          </div>
+        </div>
+        <p class="brand-subtitle">
+          Developer ZIP Deployment Workspace. Masukkan custom password akses server (<code>DEPLOY_KEY</code>) untuk membuka sesi deployment.
+        </p>
+      </header>
+
+      <form id="loginForm" class="login-form" novalidate>
+        <div class="field-group">
+          <label for="passwordInput" class="field-label">
+            <span>ACCESS PASSWORD</span>
+            <span class="mono-hint">ENV: DEPLOY_KEY</span>
+          </label>
+          <div class="password-input-wrap">
+            <input
+              type="password"
+              id="passwordInput"
+              name="password"
+              class="password-input"
+              placeholder="Masukkan password akses GitFlow..."
+              autocomplete="current-password"
+              required
+              autofocus
+            />
+            <button
+              type="button"
+              id="togglePasswordBtn"
+              class="toggle-password-btn"
+              aria-label="Tampilkan atau sembunyikan password"
+              aria-pressed="false"
+            >
+              <span id="togglePasswordText">SHOW</span>
+            </button>
+          </div>
+        </div>
+
+        <div id="loginError" class="login-error" role="alert" hidden>
+          <span class="error-dot" aria-hidden="true"></span>
+          <span id="loginErrorText">Password akses salah.</span>
+        </div>
+
+        <button type="submit" id="loginSubmitBtn" class="login-submit-btn">
+          <span id="loginBtnLabel">UNLOCK WORKSPACE</span>
+          <span id="loginSpinner" class="btn-spinner" hidden aria-hidden="true"></span>
+        </button>
+      </form>
+
+      <footer class="login-footer">
+        <div class="security-pill">
+          <span class="status-dot"></span>
+          <span>Zero Client Secrets · Server-Validated Session</span>
+        </div>
+        <p class="principle-line">One ZIP. One destination. One clean commit.</p>
+      </footer>
+    </section>
+  </main>
+
+  <script>
+    (function () {
+      'use strict';
+
+      var form = document.getElementById('loginForm');
+      var passwordInput = document.getElementById('passwordInput');
+      var toggleBtn = document.getElementById('togglePasswordBtn');
+      var toggleText = document.getElementById('togglePasswordText');
+      var errorBox = document.getElementById('loginError');
+      var errorText = document.getElementById('loginErrorText');
+      var submitBtn = document.getElementById('loginSubmitBtn');
+      var btnLabel = document.getElementById('loginBtnLabel');
+      var spinner = document.getElementById('loginSpinner');
+
+      function setLoading(loading) {
+        submitBtn.disabled = loading;
+        spinner.hidden = !loading;
+        btnLabel.textContent = loading ? 'VERIFYING...' : 'UNLOCK WORKSPACE';
+      }
+
+      function showError(msg) {
+        errorText.textContent = msg || 'Password akses salah.';
+        errorBox.hidden = false;
+      }
+
+      function hideError() {
+        errorBox.hidden = true;
+      }
+
+      toggleBtn.addEventListener('click', function () {
+        var isPassword = passwordInput.type === 'password';
+        passwordInput.type = isPassword ? 'text' : 'password';
+        toggleText.textContent = isPassword ? 'HIDE' : 'SHOW';
+        toggleBtn.setAttribute('aria-pressed', isPassword ? 'true' : 'false');
+      });
+
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        hideError();
+        var password = passwordInput.value;
+        if (!password) {
+          showError('Password tidak boleh kosong.');
+          return;
+        }
+
+        setLoading(true);
+
+        fetch('/api/auth-check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: password }),
+          cache: 'no-store'
+        })
+          .then(function (res) {
+            return res.json().then(function (data) {
+              return { ok: res.ok, data: data };
+            });
+          })
+          .then(function (result) {
+            if (result.ok && result.data.ok && result.data.token) {
+              try {
+                sessionStorage.setItem('gitflow_session_token', result.data.token);
+              } catch (_) {}
+              window.location.replace('/dashboard.html');
+            } else {
+              showError((result.data && result.data.error) || 'Password akses salah.');
+              setLoading(false);
+            }
+          })
+          .catch(function () {
+            showError('Gagal terhubung ke server. Coba lagi.');
+            setLoading(false);
+          });
+      });
+    })();
+  </script>
+</body>
+</html>
