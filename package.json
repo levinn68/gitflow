@@ -1,1 +1,13 @@
-{"name":"gitflow","version":"1.0.0","private":true}
+{
+  "name": "gitflow",
+  "version": "1.0.0",
+  "description": "GitFlow - GitHub repository management and deployment tool",
+  "main": "index.js",
+  "scripts": {
+    "start": "vercel dev"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=18"
+  }
+}
