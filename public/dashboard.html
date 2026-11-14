@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GitFlow — ZIP Deployment Workspace</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/dashboard.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-mark">GF</div>
+        <div class="brand-name">GitFlow <span>v1.0</span></div>
+      </div>
+      <nav>
+        <ul class="nav-list">
+          <li class="nav-item"><a href="#" class="active" data-panel="deploy">Deploy ZIP</a></li>
+          <li class="nav-item"><a href="#" data-panel="repos">Repositories</a></li>
+          <li class="nav-item"><a href="#" data-panel="create">Create Repo</a></li>
+        </ul>
+      </nav>
+      <div class="status-bar" style="margin-top:auto">
+        <span class="status-dot"></span>
+        <span id="userStatus">Checking session...</span>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <!-- Deploy Panel -->
+      <section id="panel-deploy" class="panel">
+        <h2 style="font-size:20px;margin-bottom:20px;font-weight:700">ZIP Deployment</h2>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-title">Target Repository</div>
+            <div class="field">
+              <label>Owner / Org</label>
+              <input type="text" id="deployOwner" placeholder="username or org" />
+            </div>
+            <div class="field">
+              <label>Repository</label>
+              <input type="text" id="deployRepo" placeholder="repo-name" />
+            </div>
+            <div class="field">
+              <label>Branch</label>
+              <input type="text" id="deployBranch" value="main" />
+            </div>
+            <div class="field">
+              <label>Commit Message</label>
+              <input type="text" id="deployMessage" value="Upload project files" />
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">ZIP File</div>
+            <div class="dropzone" id="dropzone">
+              <div class="dropzone-icon">📦</div>
+              <div class="dropzone-text">Drop ZIP here or click to browse</div>
+              <div class="dropzone-hint">Max 4 MB · up to 400 files</div>
+              <input type="file" id="zipInput" accept=".zip,application/zip" hidden />
+            </div>
+            <div id="selectedFile" style="margin-top:12px;font-size:13px;color:var(--text-secondary);display:none"></div>
+            <button class="btn btn-primary" id="deployBtn" style="margin-top:16px;width:100%" disabled>
+              Deploy to GitHub
+            </button>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:20px">
+          <div class="card-title">Process Monitor</div>
+          <div class="monitor" id="monitor">
+            <div class="log-info">Ready. Select a ZIP and target repository.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Repos Panel -->
+      <section id="panel-repos" class="panel" hidden>
+        <h2 style="font-size:20px;margin-bottom:20px;font-weight:700">Your Repositories</h2>
+        <div class="card">
+          <div class="field">
+            <label>Search</label>
+            <input type="text" id="repoSearch" placeholder="Filter by name..." />
+          </div>
+          <div class="repo-list" id="repoList">
+            <div style="color:var(--text-muted);padding:12px">Loading...</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Create Panel -->
+      <section id="panel-create" class="panel" hidden>
+        <h2 style="font-size:20px;margin-bottom:20px;font-weight:700">Create New Repository</h2>
+        <div class="card" style="max-width:480px">
+          <div class="field">
+            <label>Repository Name</label>
+            <input type="text" id="newRepoName" placeholder="my-new-project" />
+          </div>
+          <div class="field">
+            <label>Description (optional)</label>
+            <input type="text" id="newRepoDesc" placeholder="Short description" />
+          </div>
+          <div class="field">
+            <label>Visibility</label>
+            <select id="newRepoVisibility">
+              <option value="public">Public</option>
+              <option value="private">Private</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" id="createRepoBtn">Create Repository</button>
+          <div id="createResult" style="margin-top:14px;font-size:13px"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/js/deployer.js"></script>
+</body>
+</html>
