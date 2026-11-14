@@ -1,13 +1,18 @@
 {
-  "name": "gitflow",
+  "name": "gitflow-zip-deployer",
   "version": "1.0.0",
-  "description": "GitFlow - GitHub repository management and deployment tool",
-  "main": "index.js",
-  "scripts": {
-    "start": "vercel dev"
-  },
-  "dependencies": {},
+  "private": true,
+  "description": "GitFlow — Premium GitHub ZIP Deployment Workspace (Vercel Serverless + GitHub REST API)",
   "engines": {
-    "node": ">=18"
+    "node": ">=18.x"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "jszip": "^3.10.1"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod",
+    "test": "node test/verify-gitflow.js"
   }
 }
